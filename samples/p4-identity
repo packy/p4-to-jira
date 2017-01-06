@@ -1,0 +1,14 @@
+# this is a sample Perforce identity file
+# by default, p4-to-jira looks for this in $HOME/.p4-identity
+
+# lines with only whitespace or whitespace followed by a # are ignored
+# comments are NOT allowed on lines with keywords
+# the keywords required by p4-to-jira are P4PORT, P4USER, and P4PASSWD
+
+# this is not required if the user running p4-to-jira is already
+# logged into Perforce when the script is run.  this is only required
+# if p4-to-jira needs to log into Perforce itself.
+
+P4PORT   perforce.yourdomain.com:4321
+P4USER   p4_autouser
+P4PASSWD AFakePasswordThatIsActuallyMinimallySecure

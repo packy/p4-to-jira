@@ -1,0 +1,1031 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use 5.010;
+
+our $VERSION = 0.01;
+
+use Readonly 2.04;
+
+###########################################################################
+#
+# the only defaults I think can set
+
+Readonly my %DEFAULTS => (
+    bin_dir          => $FindBin::Bin,
+    base_dir         => dirname( $FindBin::Bin ),
+    config           => '[% var_dir %]/p4-to-jira.conf',
+    last_change_file => '[% var_dir %]/last_change.txt',
+    log_dir          => '[% base_dir %]/log',
+    log_name_pattern => 'p4-to-jira_%Y-%m-%d.log',
+    log_timestamp    => '%Y-%m-%d %H:%M:%S',
+    max_diff_len     => '4K',
+    ssl_verify_none  => 1, # allow self-signed certs
+    var_dir          => '[% base_dir %]/var',
+    verbose          => 0, # default level
+);
+
+###########################################################################
+#
+# define some constants
+
+Readonly my @P4VARS => qw/ P4PORT P4USER P4PASSWD /;
+
+Readonly my @REQUIRED_CONFIG => qw( p4_project jira_project jira_url );
+
+Readonly my @KNOWN_CONFIG => @REQUIRED_CONFIG, qw(
+      p4_identity ccollab_url jira_username jira_password ssl_verify_none
+      last_change last_change_file max_diff_len log_dir log_timestamp
+      log_name_pattern verbose fake
+);
+
+Readonly my $COPYRIGHT_START => '2017';
+
+###########################################################################
+#
+# use some modules ;)
+
+use Carp;
+use Cwd qw( realpath );
+use File::Basename;
+use File::Spec;
+use FindBin;
+use Getopt::Long;
+use JIRA::REST::Class;
+use List::Util qw( any max sum );
+use Path::Tiny;
+use Pod::Usage;
+use POSIX qw( strftime );
+use Template;
+
+###########################################################################
+#
+# let's get this party started
+
+$SIG{__DIE__} = sub { write_log(@_); write_log("Job aborted!!!"); };
+
+# copy the defaults into the config hash
+my %CONFIG = %DEFAULTS;
+
+read_config_file();
+
+parse_command_line();
+
+login_to_perforce();
+
+# copy these so we can use them as variables instead of hash elements
+my $jira_project = $CONFIG{jira_project};
+my $p4_project   = $CONFIG{p4_project};
+my $max_diff_len = fromTGMK( $CONFIG{max_diff_len} );
+
+#
+# find the last change ID we processed
+#
+my $last;
+
+# from either the command line or the config file
+if ( exists $CONFIG{last} ) {
+    $last = $CONFIG{last};
+}
+# if there's a file for storing the last change, read that
+elsif ( exists $CONFIG{last_change_file} && -f $CONFIG{last_change_file} ) {
+    $last = path( $CONFIG{last_change_file} )->slurp;
+}
+
+# arguments to pass into JIRA::REST::Class->new
+my $jira_args = {
+    url             => $CONFIG{jira_url},
+    ssl_verify_none => ($CONFIG{ssl_verify_none} ? 1 : 0)
+};
+
+# if the username/password for the JIRA server aren't specified,
+# JIRA::REST::Class goes looking for a $HOME/.jira file for credentials
+$jira_args->{username} = $CONFIG{jira_username} if exists $CONFIG{jira_username};
+$jira_args->{password} = $CONFIG{jira_password} if exists $CONFIG{jira_password};
+
+my $jira = JIRA::REST::Class->new( $jira_args );
+
+#
+# call p4 to get the changes since the last run
+#
+my @changes = changes_since($last);
+
+write_log("Got changes: ".join ', ', @changes) if verbose3();
+
+#
+# now we loop over each of these changes
+#
+foreach my $change ( @changes ) {
+
+    # get the description of the change
+    my $description = description_of($change);
+
+    write_log("Change $change description:\n$description") if verbose3();
+
+    unless ($description =~ /$jira_project-\d+/) {
+        write_log("No JIRA key in $change; skipping") if verbose1();
+        next;
+    }
+
+    $description =~ s/^\h+//gm; # strip leading whitespace from lines
+
+    # if we mention more than one JIRA issue in the text, get ALL of them
+    my @keys = $description =~ /($jira_project-\d+)/g;
+
+    # look for Code Collaborator reviews in the description
+    $description = code_collaborator($description);
+
+    # get the file list for the change
+    my $files = files_in($change);
+    write_log("Change $change files:\n$files") if verbose3();
+
+    # loop over each of the files and get the diff for the file
+    my @diffs;
+    foreach my $file (split /\n/, $files) {
+        push @diffs, diff_from_previous($file);
+    }
+
+    my $diffs    = join "\n\n", @diffs;
+    my $diff_len = length($diffs);
+    my $diff_name;
+
+    if ( $diff_len >= $max_diff_len ) {
+        $diff_name = "change_${change}_diffs.txt";
+    }
+
+    #
+    # now, let's build the comment that we're adding to JIRA
+    #
+    my $comment = $description;
+    $comment .= "\nAffected files ...\n\n";
+    $comment .= $files;
+
+    if ($diff_name) {
+        $comment .= "\n\nDifferences are " . toTGMK($diff_len);
+        $comment .= "\nAttaching diffs as $diff_name";
+    }
+    else {
+        $comment .= "\n\nDifferences ...\n\n";
+        $comment .= '{code:diff}' . $diffs . '{code}';
+    }
+
+    # get a JIRA::REST::Class object for each issue mentioned,
+    # and use it to add a comment
+    foreach my $issue ( $jira->issues(@keys) ) {
+        my $key = $issue->key;
+
+        if ( in_fake_mode() ) {
+            write_log("Not adding comment for change $change to $key ".
+                      "(fake mode)");
+            write_log("Comment not added to $key\n$comment")
+        }
+        else {
+            if ($diff_name) {
+                eval {
+                    local $SIG{__DIE__} = sub { write_log(@_); };
+                    $issue->add_data_attachment($diff_name, $diffs);
+                };
+            }
+            $issue->add_comment($comment);
+
+            write_log("Adding comment for change $change to $key");
+            write_log("Comment:\n$comment") if verbose3();
+        }
+    }
+
+    # update the last_change file now that we processed this change
+    if ( exists $CONFIG{last_change_file} && ! in_fake_mode() ) {
+        path( $CONFIG{last_change_file} )->spew($change);
+    }
+}
+
+sub code_collaborator {
+    my ($description) = @_;
+    if ( $CONFIG{ccollab_url} ) {
+        my($id) = $description =~ m{Review:\s+ID\s+(\d+)}s;
+        my $url = sprintf $CONFIG{ccollab_url}, $id;
+        $description =~ s{(Review:\s+ID\s+$id)}{[$1|$url]}s;
+    }
+    return $description;
+}
+
+sub changes_since {
+    my $last = shift;
+
+    # we want to start with the NEXT change after the last one processed
+    my $next = $last + 1;
+
+    # gets a list of changes as separate lines, then splits each of those lines
+    # on whitespace and keeps only the second element (the change ID), and then
+    # sorts those numeric IDs in ascending order
+
+    my @changes =
+        sort map { +(split)[1] } perforce("changes $p4_project\@$next,#head");
+}
+
+sub description_of {
+    my $change = shift;
+    return perforce("changes -l $p4_project\@$change,$change");
+}
+
+sub files_in {
+    my $change = shift;
+    return perforce("files $p4_project\@$change,$change");
+}
+
+sub diff_from_previous {
+    my $file = shift;
+
+    # grab the path (before the #) and rev (number after the #)
+    my($path, $rev) = $file =~ m{^([^\#]+)\#(\d+)};
+
+    my $prev = $rev - 1; # what's the previous revision?
+
+    if ($prev > 0) {
+        # if there was a previous revision,
+        # get the differences from perforce
+        my $diff = perforce("diff2 $path#$prev $path#$rev");
+        return $diff;
+    }
+    else {
+        # otherwise, just note that it was a new file
+        return "==== $path added ====\n";
+    }
+}
+
+sub perforce {
+    my $cmd = shift;
+    write_log("running: p4 $cmd") if verbose2();
+    return `p4 $cmd`;
+}
+
+sub login_to_perforce {
+    # if perforce is already logged in, don't worry about it
+    return if system("p4 login -s >/dev/null 2>&1") == 0;
+
+    get_p4_identity()
+        unless p4_vars_defined_in_ENV();
+
+    my $err = `echo "$ENV{P4PASSWD}" | p4 login 2>&1`;
+
+    if ($? != 0) {
+        # we hit an error!
+        $err =~ s/^Enter password:\s+//; # get rid of the prompt
+
+        croak "Unable to log into Perforce: $err";
+    }
+}
+
+sub p4_vars_defined_in_ENV {
+    foreach my $var ( @P4VARS ) {
+        return 0 unless exists  $ENV{$var}
+                     && defined $ENV{$var}
+                     && length  $ENV{$var};
+    }
+    return 1;
+}
+
+sub get_p4_identity {
+    #
+    # try to load the information from an identity file
+    #
+    eval { require Config::Identity; Config::Identity->VERSION(0.0019) }
+        or croak "Can't load Config::Identity 0.0019 or later.\n";
+
+    my %id;
+    if ($CONFIG{p4_identity} && -f $CONFIG{p4_identity}) {
+        %id = Config::Identity->load( $CONFIG{p4_identity} );
+    }
+    else {
+        %id = Config::Identity->load_best( 'p4' );
+    }
+    my @missing = grep { ! defined $id{$_} } @P4VARS;
+
+    if ( @missing ) {
+        my $inflect = @missing > 1 ? "fields" : "field";
+        croak "Missing required ${inflect}: @missing"
+    }
+
+    foreach my $var ( @P4VARS ) {
+        $ENV{$var} = $id{$var};
+    }
+}
+
+sub toTGMK {
+    my $size = shift;
+
+    return $size if $size =~ /\d+\s*(t|g|m|k|bytes)/i;
+
+    my %units = (
+        1099511627776 => 'T',
+        1073741824    => 'G',
+        1048576       => 'M',
+        1024          => 'K',
+    );
+    foreach my $div (reverse sort keys %units) {
+        next unless $size >= $div;
+        my $num = sprintf '%0.2f', $size / $div;
+        $num =~ s/0+$//; # remove trailing 0s
+        $num =~ s/\.$//; # if it now ends in a decimal point, remove that
+        return $num.$units{$div};
+    }
+    return $size . ' bytes';
+}
+
+sub fromTGMK {
+    my $size = shift;
+
+    my %units = (
+        T => 1099511627776,
+        G => 1073741824,
+        M => 1048576,
+        K => 1024,
+    );
+
+    while ( my($num, $unit) = $size =~ /([\d\.]+)\s*(t|g|m|k)/i ) {
+        my $new = $num * $units{uc $unit};
+        $size =~ s/$num\s*$unit/$new /;
+    }
+
+    $size =~ s/\s+$//; # strip trailing whitespace
+    $size = sum split /\s+/, $size;
+
+    return $size;
+}
+
+###########################################################################
+#
+# misc config checks
+
+sub in_fake_mode { $CONFIG{fake} }
+
+sub verbose  { $CONFIG{verbose} >= 0 }
+sub verbose1 { $CONFIG{verbose} >= 1 }
+sub verbose2 { $CONFIG{verbose} >= 2 }
+sub verbose3 { $CONFIG{verbose} >= 3 }
+
+###########################################################################
+#
+# logging routines
+
+my $logfile;
+
+sub set_log_file {
+    my($value) = @_;
+
+    if ($value) {
+        my($name, $dir) = fileparse( $value );
+
+        if ($dir eq './' && $value !~ m{^\./}) {
+            undef $dir; # if it wasn't explicitly the current directory,
+                        # we're putting the log in the log directory
+        }
+        $CONFIG{log_name_pattern} = $name;
+        $CONFIG{log_dir}          = $dir if defined $dir;
+    }
+    else {
+        # if we were explicitly passed an undefined/blank value,
+        # clear out the logfile variable and just return
+        if (@_ == 1) {
+            undef $logfile;
+            return;
+        }
+    }
+
+    # put the log file path together
+    my $path
+        = File::Spec->catfile( $CONFIG{log_dir}, $CONFIG{log_name_pattern} );
+
+    # if we have any macros in this path, epand them
+    $path = expand_config_macros( $path );
+
+    # and format it with strftime
+    $logfile = strftime( $path, localtime );
+
+    return;
+}
+
+sub write_log {
+    my $ts = strftime($CONFIG{log_timestamp}, localtime);
+
+    my $text = join( "\n", map { "$ts $_" } @_ ) . "\n";
+
+    if ($logfile) {                    # if a logfile is defined,
+        path($logfile)->append($text); # write it to the file
+    }
+    else {
+        print $text; # otherwise, just print to STDOUT
+    }
+}
+
+sub stderr_log {
+    my $line = shift;
+    write_log($line) if $logfile;
+    print STDERR "$line\n";
+}
+
+sub die_log {
+    my $line = shift;
+    write_log($line);
+    die "$line\n";
+}
+
+###########################################################################
+#
+# processing the config file
+#
+
+sub recursive_tt_process {
+    my ( $in, $vars ) = @_;
+
+    state $tt = Template->new;
+
+    $tt->process(\$in, $vars, \my $out);
+
+    $out = recursive_tt_process( $out, $vars )
+        if $out =~ /\[%.*%\]/; # if there are more macros to expand
+
+    return $out;
+}
+
+sub expand_config_macros {
+    my $in = shift;
+    return recursive_tt_process( $in, { %ENV, %CONFIG } );
+}
+
+sub is_known_config_key {
+    my $key = shift;
+    return any { $_ eq $key } @KNOWN_CONFIG;
+}
+
+sub read_config_file {
+    my $file = $CONFIG{config}; # get the default location
+
+    #
+    # First, look for a command line option to set a config file name
+    #
+    Getopt::Long::Configure('pass_through'); # ignore the other parameters
+    GetOptions
+        'verbose+' => \$CONFIG{verbose},
+        'config=s' => \$file;
+
+    $file = expand_config_macros( $file );
+
+    set_log_file();
+    write_log("Reading config file $file") if verbose1();
+
+    # if there's no config file, that's fine
+    return unless -f $file;
+
+    my $fh = IO::File->new($file, 'r')
+        or die "Failed to open [$file]: [$!]";
+
+    my $num = 0;
+    while (my $line = $fh->getline) {
+        chomp $line;
+        $line =~ s/\s*(?<!\\)\#.*$//; # remove everything after unquoted #
+        $line =~ s/^\s+//;            # remove leading whitespace
+
+        $num++;
+
+        next unless $line =~ m/\S/;
+
+        my ($key, $value) = split /\s+/, $line, 2;
+
+        if ($key eq 'log') {
+            set_log_file( $value );
+            next;
+        }
+        if ($key eq 'nolog') {
+            set_log_file( undef );
+            next;
+        }
+
+        unless ( is_known_config_key( $key ) ) {
+            # if the key isn't recognized, try changing dashes to underscores
+            my $new_key = option_to_key( $key );
+            if ( is_known_config_key( $new_key ) ) {
+                $key = $new_key;
+            }
+        }
+
+        die_log("unknown configuration parameter '$key' in $file, line $num")
+            unless is_known_config_key( $key );
+
+        $CONFIG{$key} = expand_config_macros( $value );
+    }
+
+    $fh->close;
+
+    return;
+}
+
+###########################################################################
+#
+# processing the command line
+#
+
+sub option_to_key {
+    my $key = shift;
+    $key =~ s/\-/_/g; # convert dashes to underscores
+    return $key;
+}
+
+sub parse_command_line {
+    #
+    # This magic right here allows us to have 'macros' in the POD that
+    # get replaced with the values of perl variables!
+    #
+    my $pod = IO::File->new($0, 'r');
+    tie *POD, 'Filter::Handle', $pod, \&process_tt_in_POD;
+
+    #
+    # now we collect the rest of the command line options
+    # these options can now override values from the config file
+    #
+
+    Getopt::Long::Configure('no_pass_through'); # don't ignore unknown params
+
+    my $to_config = sub {
+        my ($name, $value) = @_;
+
+        my $key = option_to_key( $name );
+
+        die "unknown option '$name'"
+            unless is_known_config_key( $key );
+
+        $CONFIG{$key} = $value;
+    };
+
+    my ($dump_sample_config);
+
+    GetOptions
+        'p4-project=s'       => $to_config,
+        'p4-identity=s'      => $to_config,
+        'jira-project=s'     => $to_config,
+        'jira-url=s'         => $to_config,
+        'last-change=i'      => $to_config,
+        'last-change-file=s' => $to_config,
+        'max-diff-len=i'     => $to_config,
+        'fake!'              => $to_config,
+        'log-dir=s'          => $to_config,
+        'log-timestamp=s'    => $to_config,
+        'nolog'              => sub { set_log_file( undef ) },
+        'log=s'              => sub { set_log_file( $_[1] ) },
+        'dump-sample-config' => \$dump_sample_config,
+        'man' => sub {
+            pod2usage( -verbose => 2, # full man page
+                       -exitval => 0,
+                       -input  => \*POD );
+        },
+        'help' => sub {
+            pod2usage( -sections => 'USAGE',
+                       -exitval => 0,
+                       -input  => \*POD );
+        },
+        or pod2usage( -sections => 'USAGE', -exitval => 1, -input => \*POD );
+
+    # both these exit if true
+    dump_sample_config() if $dump_sample_config;
+
+    set_log_file();
+
+    # if we didn't get all the parameters we needed, die
+    my $die;
+    foreach my $req ( @REQUIRED_CONFIG ) {
+        next if exists $CONFIG{$req};
+        $die++;
+        stderr_log("You must specify $req in either the config file or ".
+                   "via a command line option");
+    }
+
+    if ($die) {
+        die_log('missing required parameters');
+    }
+
+    # value fixup
+    $CONFIG{ccollab_url} =~ s{\\#}{#}g;
+
+    return;
+}
+
+sub dump_sample_config {
+
+    # set some defaults
+    my $SELF = basename($0);
+
+    my $varlen = 6 + max map { length($_) } keys %CONFIG;
+    my $vallen = 74 - $varlen;
+
+    my $VARS = sprintf "# %-*s  %s\n# %-*s  %s\n",
+        $varlen, ' Variable',   ' Current Value',
+        $varlen, '-' x $varlen, '-' x $vallen;
+
+    foreach my $key ( sort keys %CONFIG ) {
+        $VARS .= sprintf "# %-*s  %s\n",
+        $varlen, qq{[% $key %]}, $CONFIG{$key};
+    }
+
+    print <<SAMPLE1;
+# this is a sample configuration file for $SELF
+
+# the following three parameters are REQUIRED. They must be either
+# specified in a config file or on the command line, or the script
+# will terminiate with an error.
+
+p4_project    //depot/trunk/...
+jira_project  JRA
+jira_url      https://jira.atlassian.com/
+
+# if any of the following parameters are omitted, a default value is used
+
+jira_username  # if not specified, script will look in \$HOME/.netrc file
+jira_password  # if not specified, script will look in \$HOME/.netrc file
+
+ssl_verify_none  1 # allow self-signed certs for JIRA server (default)
+
+# if the environment of the user running this sctipt does not have
+# the variables ${ \eval { join q/, /, @P4VARS } }, this file will be
+# used to define them
+p4_identity /path/to/.p4-identity
+
+# if you are using Code Collaborator, you can specify a URL to make
+# the text "Review: ID nnnnn" into a hyperlink.  The URL will be passed
+# through sprintf with the numeric review ID as the only parameter.
+# Any instances of \# will be converted to # as well.
+#
+# leaving this parameter blank will disable making review IDs into hyperlinks.
+#
+ccollab_url  http://p4collab.smartbear.com:8484/ui\#review:id=%d
+
+# file used to store last change ID examined
+last_change_file [% base_dir %]/var/last_change.txt
+
+# you can set the value of the last change ID examined with the 'last_change'
+# parameter; this will take precedence over anything stored in the file
+# indicated by 'last_change_file' and ${ \eval { basename($0) } } will never
+# update this value.
+#
+# last_change 12345
+
+# The maximum length the differences for a change can have before they're
+# written to a file and attached to the issue rather than included in the text
+# of the comment itself.
+max_diff_len = 4K
+
+# These two parameters determine where the log file will be written.
+# The log_name_pattern is passed through POSIX::strftime() with the
+# current local time to produce the actual log file name.
+log_dir          [% base_dir %]/log
+log_name_pattern p4-to-jira_%Y-%m-%d.log
+
+# The timestamp at the beginning of each line of the logfile,
+# formatted for POSIX::strftime()
+log_timestamp    %Y-%m-%d %H:%M:%S
+
+# setting the 'fake' parameter to 1 enables 'Fake mode'. This is used for
+# testing and debugging.  The program runs, but does not update the
+# last_change_file and does not create any comments on the JIRA issues it
+# finds. Because it doesn't create the comments, the text of what would
+# have been the comments are written to the log/stdout.
+#
+# fake
+
+# Verbosity for testing and debugging.  Increases the amount of information
+# that is logged.
+#
+#   verbose 0 (default)
+#
+#     Default verbosity.  Logs when comments are being made to JIRA
+#     issues for changes, but not the text of the comment (unless --fake
+#     is specified).  Perforce changes that are ignored because they do
+#     not have JIRA keys for the desired project are not logged.
+#
+#   verbose 1
+#
+#     All the messages from above, but logs a message indicating when a 
+#     Perforce change is skipped because it does not have any JIRA keys
+#     for the desired project.
+#
+#   verbose 2
+#
+#     All the messages from above, but also logs what Perforce commands
+#     are being run.
+#
+#   verbose 3
+#
+#     Drinking from the fire hose.  All the messages from above, but
+#     also logs:
+#       + a list of the changes that were obtained from "p4 changes"
+#       + the description that was obtained through "p4 changes -l"
+#       + the files that were obtained through "p4 files"
+#       + the text of the comment that was added to the JIRA issue
+#
+verbose 0
+
+# the template variables that are available in this file are copies of
+# all environment variables and the following special variables:
+#
+$VARS
+SAMPLE1
+
+    exit;
+}
+
+###########################################################################
+#
+# POD magic
+
+sub process_tt_in_POD {
+    my @lines = @_;
+
+    state $vars;
+    unless ($vars) { # only initialize once
+        $vars = {
+            %DEFAULTS,
+            self    => basename($0),
+            version => $VERSION,
+        };
+
+        # process any template data IN the default hash
+        foreach my $key (keys %DEFAULTS) {
+            $vars->{$key} = recursive_tt_process( $vars->{$key}, $vars );
+        }
+
+        my $log = File::Spec->catfile( $DEFAULTS{log_dir},
+                                       $DEFAULTS{log_name_pattern} );
+        $vars->{default_log} = recursive_tt_process( $log, $vars );
+
+        $vars->{max_diff_len} = toTGMK( $DEFAULTS{max_diff_len} );
+
+        $vars->{copyright_year} = strftime("%Y", localtime);
+
+        if ($vars->{copyright_year} ne $COPYRIGHT_START) {
+            # so we automatically get a range of years
+            $vars->{copyright_year}
+                = join q{-}, $COPYRIGHT_START, $vars->{copyright_year};
+        }
+    }
+
+    foreach my $line ( @lines ) {
+        $line = recursive_tt_process( $line, $vars );
+    }
+
+    return @lines;
+}
+
+
+###########################################################################
+#
+# adapted from http://www.perlmonks.org/?node_id=27415
+
+package Filter::Handle;
+use strict;
+use Carp;
+
+sub READLINE {
+  my $self = shift;
+  my $fh = $self->{fh};
+  if (wantarray) {
+      return $self->{disp}->(<$fh>);
+  }
+  my $line = <$fh>;
+  return if ! defined $line;
+
+  ($line) = $self->{disp}->($line);
+  return $line;
+}
+
+sub TIEHANDLE {
+  my $class = shift;
+  my $fh = shift or croak("Need a filehandle to tie to.");
+  my $disp = shift || sub { @_ };
+  return bless ({fh => $fh, disp => $disp}, $class);
+}
+
+
+__END__
+
+###########################################################################
+#
+# we're putting the POD at the end
+
+=pod
+
+=encoding UTF-8
+
+=head1 NAME
+
+[% self %] - a script to pull the latest changes to a Perforce repository and
+add them as comments to their corresponding JIRA issues.
+
+=head1 VERSION
+
+S<Version [% version %]>
+
+=head1 DESCRIPTION
+
+This is a tool to supplant Atlassian FishEye, which has just too much
+configuration and complexity.  If all you want is comments on your JIRA issues
+with the changes that correspond to those issues, then this is the tool for you.
+
+When this script is run, it looks for a B<last-change-file> (see L</"OPTIONS">
+for details on where this file is stored and how to change that), which it reads
+to see what the last change ID processed was.  It then uses C<p4 changes> to
+list all the changes that have occured since that change, and examines the
+description for strings that look like keys to JIRA issues in the JIRA project
+it is configured for.  If any keys are found, it packages up the description,
+the changed file list, and a diff of the changes and posts that as a comment on
+that issue.  If the diff of the changes is larger than [% max_diff_len %]
+(configurable on the command line or in a config file), the diffs will be
+written to a file and that file will be attached along with the comment
+containing the description, the changed file list, and the name of the
+attachment with the diffs.
+
+Each time an issue is processed, the B<last-change-file> is updated so the
+script doesn't need to examine those issues again.  Ideally, this script can be
+set up to run via a cron job.
+
+=head1 USAGE
+
+[% self %] [options]
+
+=head2 OPTIONS
+
+=over 2
+
+=item B<--config> I</path/to/config_file.conf>
+
+The path to a configuration file which can specify all the options available on
+the command line.  The default for this file is [% config %].  If the file does
+not exist, the directive will be ignored.
+
+=item B<--dump-sample-config>
+
+Dumps a sample configuration file to STDOUT and exits.
+
+=item B<--p4-project> I<//path/to/perforce/project/...>
+
+The path to the Perforce project the command will be getting changes from, in
+Perforce's URL format starting with //. There is no default for this value: it
+must either be set via the command line or via a configuration file. If it is
+not set, the script will terminate.
+
+=item B<--p4-identity> I</path/to/identity.file>
+
+[optional if the user running the script is already logged into Perforce] This
+option specifies the path to a file that will be read by L<Config::Identity>
+that specifies the values for three Perforce environment variables: P4PORT,
+P4USER, P4PASSWD.  These values will be used to authenticate against the
+Perforce server.  Note that a local perforce client isn't necessary, since the
+only commands used are C<p4 changes>, C<p4 files>, and C<p4 diff2>.
+
+=item B<--jira-project> I<JIRA-project-key>
+
+The key of the project whose issues we're looking for. There is no default for
+this value: it must either be set via the command line or via a configuration
+file. If it is not set, the script will terminate.
+
+=item B<--jira-url> I<url-to-JIRA-server>
+
+The URL of the JIRA server.  There is no default for this value: it must either
+be set via the command line or via a configuration file. If it is not set, the
+script will terminate.
+
+=item B<--ccollab-url> I<url-to-view-code-collaborator-review>
+
+If you are using Code Collaborator, you can specify a URL to make
+the text C<Review: ID nnnnn> into a hyperlink.  The URL will be passed
+through sprintf with the numeric review ID as the only parameter.
+Any instances of C<\#> will be converted to C<#> as well.
+
+Leaving this parameter blank will disable making review IDs into hyperlinks.
+
+=item B<--last-change> I<change_id>
+
+The change ID of the last change that was examined by this script; the script
+will start looking at change ID B<+ 1>.  If not specified, the script will read
+the B<last-change-file> to determine the last change ID examined.  If no value
+for last change ID can be determined, the script will start with change ID 1.
+
+=item B<--last-change-file> I</path/to/last/change.txt>
+
+The pathname of the file to be used to determine the change ID of the last
+change that was examined by this script.  This file will be updated when the
+script examines a new change.  Defaults to the file
+C<[% base_dir %]/var/last_change.txt>.
+
+=item B<--max-diff-len> I<number_of_bytes>
+
+The maximum length the differences for a change can have before they're written
+to a file and attached to the issue rather than included in the text of the
+comment itself.  Defaults to [% max_diff_len %].
+
+=item B<--log-timestamp> I<strftime_format>
+
+The timestamp at the beginning of each line of the logfile.  Defaults to
+C<%Y-%m-%d %H:%M:%S>
+
+=item B<--log-dir> I</directory/to/put/logfile/in>
+
+The directory where the logfile is to be written. Ignored if B<--log>
+specifies a fully-qualified pathname to a file.
+
+=item B<--log> I</path/to/logfile>
+
+The file where the log is to be written.  Defaults to the file
+C<[% default_log %]>.  The file name is passed through
+C<POSIX::strftime()> with the current local time.  If B<--log> only specifies a
+filename, the file is written to the default log directory, C<[% log_dir %]>.
+
+=item B<--nolog>
+
+Specifies that no log is to be written and log messages are to be written to
+stdout.
+
+=item B<--fake>
+
+Fake mode.  This is used for testing and debugging.  The program runs, but does
+not update the B<last-change-file> and does not create any comments on the JIRA
+issues it finds.  Because it doesn't create the comments, the text of what
+I<would> have been the comments are written to the log/stdout.
+
+=item B<--verbose>
+
+Verbosity for testing and debugging.  Increases the amount of information that
+is logged.  May be specified more than once for more verbosity.
+
+=over 4
+
+=item I<(option not specified)>
+
+Default verbosity.  Logs when comments are being made to JIRA issues for
+changes, but not the text of the comment (unless B<--fake> is specified).
+Perforce changes that are ignored because they do not have JIRA keys for the
+desired project are not logged.
+
+=item I<--verbose>
+
+Verbosity 1.  All the messages from above, but logs a message indicating when a
+Perforce change is skipped because it does not have any JIRA keys for the
+desired project.
+
+=item I<--verbose --verbose>
+
+Verbosity 2.  All the messages from above, but also logs what Perforce commands
+are being run.
+
+=item I<--verbose --verbose --verbose>
+
+Verbosity 3.  Drinking from the fire hose.  All the messages from above, but
+also logs
+
+=over 2
+
+=item +
+
+a list of the changes that were obtained from C<p4 changes>
+
+=item +
+
+the description that was obtained through C<p4 changes -l>
+
+=item +
+
+the files that were obtained through C<p4 files>
+
+=item +
+
+the text of the comment that was added to the JIRA issue
+
+=back
+
+=back
+
+=item B<--help>
+
+Prints a usage message and exits.
+
+=item B<--man>
+
+Prints the entire manual page and exits.
+
+=back
+
+=head1 AUTHOR
+
+Packy Anderson <packy@cpan.org>
+
+=head1 COPYRIGHT
+
+Copyright (c) [% copyright_year %].
+
+=head1 LICENSE
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
+
+=cut
+
+1;

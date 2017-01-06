@@ -1,0 +1,5 @@
+# Ignore everything in this directory, since it should only contain logs
+*
+# Except this file, which is the one file that lets git track
+# the directory itself
+!.gitignore
