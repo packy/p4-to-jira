@@ -202,9 +202,11 @@ foreach my $change ( @changes ) {
 sub code_collaborator {
     my ($description) = @_;
     if ( $CONFIG{ccollab_url} ) {
-        my($id) = $description =~ m{Review:\s+ID\s+(\d+)}s;
-        my $url = sprintf $CONFIG{ccollab_url}, $id;
-        $description =~ s{(Review:\s+ID\s+$id)}{[$1|$url]}s;
+        # check to see if there's a code review in the message
+        if ( my( $id ) = $description =~ m{Review:\s+ID\s+(\d+)}s ) {
+            my $url = sprintf $CONFIG{ccollab_url}, $id;
+            $description =~ s{(Review:\s+ID\s+$id)}{[$1|$url]}s;
+        }
     }
     return $description;
 }
