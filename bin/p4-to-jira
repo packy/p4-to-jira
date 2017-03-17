@@ -178,7 +178,18 @@ foreach my $change ( @changes ) {
 
     # get a JIRA::REST::Class object for each issue mentioned,
     # and use it to add a comment
-    foreach my $issue ( $jira->issues(@keys) ) {
+    my @issues;
+    try {
+        local $SIG{__DIE__} = undef;
+        @issues = $jira->issues(@keys);
+    }
+    catch {
+        write_log($_);
+        write_log("Unable to add comment for change $change to ".
+                  join(q{, }, @keys));
+    };
+
+    foreach my $issue ( @issues ) {
         my $key = $issue->key;
 
         if ( in_fake_mode() ) {
@@ -188,14 +199,27 @@ foreach my $change ( @changes ) {
         }
         else {
             if ($diff_name) {
-                eval {
-                    local $SIG{__DIE__} = sub { write_log(@_); };
+                try {
+                    local $SIG{__DIE__} = undef;
                     $issue->add_data_attachment($diff_name, $diffs);
+                }
+                catch {
+                    write_log($_);
+                    write_log("Unable to add attachment for change ".
+                              "$change to $key");
                 };
             }
-            $issue->add_comment($comment);
 
-            write_log("Adding comment for change $change to $key");
+            try {
+                local $SIG{__DIE__} = undef;
+                $issue->add_comment($comment);
+                write_log("Adding comment for change $change to $key");
+            }
+            catch {
+                write_log($_);
+                write_log("Unable to add comment for change $change to $key");
+            };
+
             write_log("Comment:\n$comment") if verbose3();
         }
     }
