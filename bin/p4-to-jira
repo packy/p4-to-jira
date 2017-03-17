@@ -57,6 +57,7 @@ use Path::Tiny;
 use Pod::Usage;
 use POSIX qw( strftime );
 use Template;
+use Try::Tiny;
 
 ###########################################################################
 #
@@ -104,6 +105,12 @@ $jira_args->{username} = $CONFIG{jira_username} if exists $CONFIG{jira_username}
 $jira_args->{password} = $CONFIG{jira_password} if exists $CONFIG{jira_password};
 
 my $jira = JIRA::REST::Class->new( $jira_args );
+
+if ($CONFIG{test_only}) {
+    print "configuration ok.\n";
+    write_log("called with --test-only; exiting");
+    exit;
+}
 
 #
 # call p4 to get the changes since the last run
@@ -274,7 +281,7 @@ sub login_to_perforce {
         # we hit an error!
         $err =~ s/^Enter password:\s+//; # get rid of the prompt
 
-        croak "Unable to log into Perforce: $err";
+        die "Unable to log into Perforce: $err\n";
     }
 }
 
@@ -295,12 +302,22 @@ sub get_p4_identity {
         or croak "Can't load Config::Identity 0.0019 or later.\n";
 
     my %id;
-    if ($CONFIG{p4_identity} && -f $CONFIG{p4_identity}) {
-        %id = Config::Identity->load( $CONFIG{p4_identity} );
+    try {
+        if ($CONFIG{p4_identity} && -f $CONFIG{p4_identity}) {
+            %id = Config::Identity->load( $CONFIG{p4_identity} );
+        }
+        else {
+            %id = Config::Identity->load_best( 'p4' );
+        }
     }
-    else {
-        %id = Config::Identity->load_best( 'p4' );
-    }
+    catch {
+        # error in $_
+        if (/unable to find/i) {
+            # we don't want line numbers
+            s/\s+at\s+.+?\s+line\s+\d+\.\Z/./;
+        }
+        die "$_\n";
+    };
     my @missing = grep { ! defined $id{$_} } @P4VARS;
 
     if ( @missing ) {
@@ -574,6 +591,7 @@ sub parse_command_line {
         'log-timestamp=s'    => $to_config,
         'nolog'              => sub { set_log_file( undef ) },
         'log=s'              => sub { set_log_file( $_[1] ) },
+        'test-only!'         => sub { $CONFIG{test_only} = $_[1] },
         'dump-sample-config' => \$dump_sample_config,
         'man' => sub {
             pod2usage( -verbose => 2, # full man page
