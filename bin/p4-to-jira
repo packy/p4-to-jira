@@ -36,7 +36,7 @@ Readonly my @REQUIRED_CONFIG => qw( p4_project jira_project jira_url );
 Readonly my @KNOWN_CONFIG => @REQUIRED_CONFIG, qw(
       p4_identity ccollab_url jira_username jira_password ssl_verify_none
       last_change last_change_file max_diff_len log_dir log_timestamp
-      log_name_pattern verbose fake
+      log_name_pattern verbose fake change
 );
 
 Readonly my $COPYRIGHT_START => '2017';
@@ -112,12 +112,24 @@ if ($CONFIG{test_only}) {
     exit;
 }
 
-#
-# call p4 to get the changes since the last run
-#
-my @changes = changes_since($last);
+my @changes;
+my $specific = 0; # we're getting the latest changes from Perforce
 
-write_log("Got changes: ".join ', ', @changes) if verbose3();
+if ( exists $CONFIG{change} &&
+     defined $CONFIG{change} &&
+     ref $CONFIG{change} eq 'ARRAY' &&
+     @{ $CONFIG{change} } > 0 ) {
+    $specific = 1; # we're getting a list of changes to work with
+    @changes = @{ $CONFIG{change} };
+}
+else {
+    #
+    # call p4 to get the changes since the last run
+    #
+    @changes = changes_since($last);
+
+    write_log("Got changes: ".join ', ', @changes) if verbose3();
+}
 
 #
 # now we loop over each of these changes
@@ -225,7 +237,7 @@ foreach my $change ( @changes ) {
     }
 
     # update the last_change file now that we processed this change
-    if ( exists $CONFIG{last_change_file} && ! in_fake_mode() ) {
+    if ( exists $CONFIG{last_change_file} && ! in_fake_mode() && ! $specific ) {
         path( $CONFIG{last_change_file} )->spew($change);
     }
 }
@@ -600,6 +612,8 @@ sub parse_command_line {
         $CONFIG{$key} = $value;
     };
 
+    $CONFIG{change} = [];
+
     my ($dump_sample_config);
 
     GetOptions
@@ -607,6 +621,7 @@ sub parse_command_line {
         'p4-identity=s'      => $to_config,
         'jira-project=s'     => $to_config,
         'jira-url=s'         => $to_config,
+        'change=i'           => sub { push @{ $CONFIG{change} }, $_[1] },
         'last-change=i'      => $to_config,
         'last-change-file=s' => $to_config,
         'max-diff-len=i'     => $to_config,
